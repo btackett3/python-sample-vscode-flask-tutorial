@@ -1,0 +1,49 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  serviceConnectionId: 'fd23c3a1-7da0-4cc6-9b86-bf4667c55be8'  # From the service connection URL in ADO settings
+  ppmUrl: 'solo.packagemanager.posit.co'      # Your Package Manager server URL
+
+steps:
+  # Reference the service connection so ADO authorizes OIDC token generation
+  - task: AzureCLI@2
+    displayName: 'Authorize service connection'
+    inputs:
+      azureSubscription: 'PackageManagerFederation-BT'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: 'echo "Service connection authorized"'
+    continueOnError: true
+
+  - script: |
+      set -eo pipefail
+
+      # Fetch the OIDC token from the Distributed Task REST API
+      OIDC_URL="$COLLECTION_URI$PROJECT_ID/_apis/distributedtask/hubs/build/plans/$PLAN_ID/jobs/$JOB_ID/oidctoken?serviceConnectionId=$SC_ID&api-version=7.1-preview.1"
+      ID_TOKEN=$(curl -sf -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d '{}' "$OIDC_URL" | jq -r .oidcToken)
+
+      # Exchange the OIDC token for a Package Manager token
+      RESPONSE=$(curl -sf -X POST "https://$PPM_URL/__api__/token" --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' --data-urlencode "subject_token=$ID_TOKEN" --data-urlencode 'subject_token_type=urn:ietf:params:oauth:token-type:id_token')
+
+      PPM_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+      echo "##vso[task.setvariable variable=PPM_TOKEN;issecret=true]$PPM_TOKEN"
+    displayName: 'Authenticate with Package Manager'
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      COLLECTION_URI: $(System.TeamFoundationCollectionUri)
+      PROJECT_ID: $(System.TeamProjectId)
+      PLAN_ID: $(System.PlanId)
+      JOB_ID: $(System.JobId)
+      SC_ID: $(serviceConnectionId)
+      PPM_URL: $(ppmUrl)
+
+  - script: |
+      export PIP_INDEX_URL="https://__token__:$PPM_TOKEN@$PPM_URL/pypi-auth/latest/simple/"
+      pip install requests numpy pandas
+    displayName: 'Install Python packages from Package Manager'
+    env:
+      PPM_TOKEN: $(PPM_TOKEN)
+      PPM_URL: $(ppmUrl)
